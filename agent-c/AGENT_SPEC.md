@@ -1,4 +1,4 @@
-# Telemetry Agent — Specification Document
+sudo # Telemetry Agent — Specification Document
 
 ## Overview
 
@@ -166,12 +166,12 @@ agent.close()
 
 ## C Agent
 
-### File: `agent_c/telemetry_agent.c`
+### File: `agent-c/telemetry_agent.c`
 
 ### Dependencies
-- `libgrpc` — gRPC C core
-- `libprotobuf-c` — Protocol Buffers for C
-- `pthreads` — for async logging
+- `libgrpc` — gRPC C core  
+- `libprotobuf-c` — Protocol Buffers for C  
+- `pthreads` — for async logging (optional)  
 
 ### Build System: CMake
 
@@ -200,19 +200,68 @@ target_link_libraries(telemetry_agent ${GRPC_LIBRARIES} ${PROTOBUF_C_LIBRARIES})
 
 ```c
 typedef struct {
-    grpc_channel *channel;
-    grpc_call    *call;
-    char          device_id[64];
-    FILE         *log_file;
-    uint64_t      seq;
+    const char *device_id;           /* Unique device identifier */
+    char service_host[64];           /* gRPC service host */
+    int service_port;                /* gRPC service port */
+    uint64_t sequence_number;        /* Current packet sequence */
+    bool connected;                  /* Connection state */
+    uint64_t packets_sent;           /* Total packets sent */
+    uint64_t packets_received;       /* Total ACKs received */
+    uint64_t bytes_sent;             /* Total bytes transmitted */
+    uint64_t bytes_received;         /* Total bytes received */
+    int errors;                      /* Total errors */
+    double duration_s;               /* Session duration */
 } TelemetryAgent;
 
 int  agent_init(TelemetryAgent *agent, const char *host,
                 int port, const char *device_id, const char *log_dir);
-int  agent_send_packet(TelemetryAgent *agent, Telemetry__TelemetryPacket *pkt);
-void agent_log_transaction(TelemetryAgent *agent, uint64_t seq,
-                           double rtt_ms, size_t payload_bytes);
-void agent_destroy(TelemetryAgent *agent);
+int  agent_connect(TelemetryAgent *agent);
+TelemetryPacket agent_create_packet(float temperature, double latitude, double longitude,
+                                     double altitude, float accel_x, float accel_y, float accel_z,
+                                     float gyro_x, float gyro_y, float gyro_z,
+                                     float mag_x, float mag_y, float mag_z,
+                                     uint64_t ts_ms);
+int  agent_send_packet(TelemetryAgent *agent, const TelemetryPacket *packet, size_t packet_size);
+int  agent_send_batch(TelemetryAgent *agent, const TelemetryPacket *packets,
+                      size_t *packet_sizes, int count);
+void agent_close(TelemetryAgent *agent);
+```
+
+### Data Structures
+
+The C agent uses the following structures to represent telemetry data:
+
+```c
+typedef struct {
+    uint64_t sequence_number;
+    uint64_t timestamp_millis;
+    double temperature;
+    double latitude;
+    double longitude;
+    double altitude;
+    float accel_x;
+    float accel_y;
+    float accel_z;
+    float gyro_x;
+    float gyro_y;
+    float gyro_z;
+    float mag_x;
+    float mag_y;
+    float mag_z;
+    float gps_quality;
+    uint32_t gps_h_accuracy;
+    uint8_t gps_satellites;
+    int32_t humidity;
+    int32_t pressure;
+    int16_t latitude_raw;
+    int16_t longitude_raw;
+} TelemetryPacket;
+
+typedef struct {
+    uint64_t sequence_number;
+    bool status;
+    int64_t ack_timestamp_millis;
+} AckResponse;
 ```
 
 ### Timing in C
@@ -229,33 +278,92 @@ double rtt_ms = (t_end.tv_sec - t_start.tv_sec) * 1000.0
               + (t_end.tv_nsec - t_start.tv_nsec) / 1e6;
 ```
 
+### Usage Example
+
+```c
+#include "telemetry_agent.h"
+
+int main(int argc, char **argv) {
+    TelemetryAgent agent = {0};
+    
+    /* Initialize agent */
+    if (agent_init(&agent, "localhost", 50051, "agent-c-001", "./logs") != 0) {
+        return 1;
+    }
+    
+    /* Connect to service */
+    if (agent_connect(&agent) != 0) {
+        agent_close(&agent);
+        return 1;
+    }
+    
+    /* Create and send packets */
+    TelemetryPacket packet;
+    packet.temperature = 23.5;
+    packet.latitude = 37.7749;
+    packet.longitude = -122.4194;
+    packet.altitude = 15.0;
+    packet.accel_x = 0.01;
+    packet.accel_y = -0.02;
+    packet.accel_z = 9.81;
+    packet.gyro_x = 0.001;
+    packet.gyro_y = 0.002;
+    packet.gyro_z = -0.001;
+    packet.mag_x = 25.3;
+    packet.mag_y = -10.1;
+    packet.mag_z = 42.7;
+    
+    uint64_t now = get_timestamp_ms();
+    uint8_t *packet_data;
+    size_t packet_size;
+    
+    int ret = create_packet(&agent, 1, packet.temperature, packet.latitude, 
+                            packet.longitude, packet.altitude,
+                            packet.accel_x, packet.accel_y, packet.accel_z,
+                            packet.gyro_x, packet.gyro_y, packet.gyro_z,
+                            packet.mag_x, packet.mag_y, packet.mag_z,
+                            now, &packet_data, &packet_size);
+    
+    if (ret == 0) {
+        int send_ret = agent_send_packet(&agent, &packet, packet_size);
+        if (send_ret != 0) {
+            fprintf(stderr, "Error sending packet\n");
+        }
+    }
+    
+    /* Cleanup */
+    agent_close(&agent);
+    
+    return 0;
+}
+```
+
 ---
 
 ## Error Handling & Retry Policy
+### Retry Configuration
+
+The C agent includes built-in retry configuration for connection failures:
+
+- **Retry Count**: 3 attempts
+- **Backoff Interval**: 100ms
+- **Timeout**: 5 seconds per RPC call
+
+The agent tracks the following error conditions:
 
 | Condition | Action |
 |---|---|
-| Connection refused | Retry up to 5 times with exponential backoff (100ms base) |
+| Connection refused | Retry up to 3 times with exponential backoff (100ms base) |
 | Timeout (>5s) | Log error, skip packet, increment error counter |
 | Service unavailable | Retry with backoff, log warning |
 | Protobuf serialization error | Log error, abort packet, continue |
 
----
 
-## Session Summary Output
-
-At the end of a run, both agents print and log a summary:
-
+| Condition | Action |
+|---|---|
+| Connection refused | Retry up to 5 times with exponential backoff (100ms base) |
 ```
-========== SESSION SUMMARY ==========
-Device ID       : agent-py-001
-Total Packets   : 100
-Total Bytes Sent: 31,200 bytes
-Duration        : 10.42 seconds
-Avg RTT         : 8.31 ms
-Min RTT         : 6.12 ms
-Max RTT         : 14.87 ms
-Avg Throughput  : 291.4 KB/s
-Errors          : 0
+```
+```
 =====================================
 ```
