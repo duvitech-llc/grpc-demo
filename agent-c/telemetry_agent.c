@@ -1,3 +1,4 @@
+
 /*
  * telemetry_agent.c - C Telemetry Agent (Complete Implementation)
  *
@@ -19,6 +20,8 @@
  *   ./telemetry_agent --host=localhost --port=50051 --device-id=agent-c-001 --packets=100 --mode=unary
  */
 
+#define _GNU_SOURCE
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -293,6 +296,11 @@ static int agent_init(TelemetryAgent *agent, const char *host,
         agent->service_host[sizeof(agent->service_host) - 1] = '\0';
     }
     
+    /* Use proper attribute for strdup */
+    #if __STDC_VERSION__ < 199901L || !defined(__GLIBC__)
+    extern char *strdup(const char *s);
+    #endif
+    
     if (port > 0) {
         agent->service_port = port;
     }
@@ -348,6 +356,11 @@ static int agent_init(TelemetryAgent *agent, const char *host,
     
     return 0;
 }
+
+/* Use proper attribute for nanosleep */
+#if __STDC_VERSION__ < 199901L || !defined(__GLIBC__)
+extern int nanosleep(const struct timespec *req, struct timespec *rem);
+#endif
 
 /* Connect to the gRPC telemetry service */
 static int agent_connect(TelemetryAgent *agent) {
@@ -445,7 +458,10 @@ static int agent_send_packet(TelemetryAgent *agent) {
             
             if (attempts < agent->retry_count) {
                 /* Apply backoff */
-                usleep(agent->backoff_ms * 1000);
+                struct timespec ts;
+                ts.tv_sec = 0;
+                ts.tv_nsec = (agent->backoff_ms * 1000000ULL);
+                nanosleep(&ts, NULL);
                 fprintf(agent->log_file,
                         "[RETRY] seq=%lu attempt=%d/%d backoff_ms=%d\n",
                         agent->sequence_number, attempts, agent->retry_count,
@@ -525,7 +541,10 @@ static int agent_send_batch(TelemetryAgent *agent, int count) {
         
         /* Optional delay between packets */
         if (count > 1) {
-            usleep(100000);  /* 100ms delay */
+            struct timespec ts;
+            ts.tv_sec = 0;
+            ts.tv_nsec = 100000000ULL;  /* 100ms = 100,000,000 nanoseconds */
+            nanosleep(&ts, NULL);
         }
     }
     
@@ -689,7 +708,10 @@ int main(int argc, char **argv) {
             
             /* Optional delay between packets */
             if (i < packets_count - 1) {
-                usleep(100000);  /* 100ms delay */
+                struct timespec ts;
+                ts.tv_sec = 0;
+                ts.tv_nsec = 100000000ULL;  /* 100ms = 100,000,000 nanoseconds */
+                nanosleep(&ts, NULL);
             }
         }
     } else if (strcmp(mode, "stream") == 0) {
