@@ -26,11 +26,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
 #include <time.h>
 #include <stdbool.h>
 #include <libgen.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <sys/wait.h>
+#include <errno.h>
+#include <curl/curl.h>
 
 /* Optional gRPC includes - conditionally compiled */
 #ifdef USE_GRPC
@@ -176,6 +180,42 @@ static int create_packet(TelemetryAgent *agent, uint64_t seq,
                          float gyro_x, float gyro_y, float gyro_z,
                          float mag_x, float mag_y, float mag_z,
                          uint64_t ts_ms);
+
+/* Generate mock sensor data similar to agent-py DataGenerator */
+static void generate_mock_sensor_data(uint64_t seq,
+                                     float *temperature, double *latitude, double *longitude,
+                                     double *altitude, float *accel_x, float *accel_y, float *accel_z,
+                                     float *gyro_x, float *gyro_y, float *gyro_z,
+                                     float *mag_x, float *mag_y, float *mag_z) {
+    /* Base location near San Francisco */
+    const double base_lat = 37.7749;
+    const double base_lon = -122.4194;
+    const double base_alt = 10.0;
+
+    /* Simple pseudo-random variations */
+    double r1 = ((double)rand() / (double)RAND_MAX) - 0.5;
+    double r2 = ((double)rand() / (double)RAND_MAX) - 0.5;
+    double r3 = ((double)rand() / (double)RAND_MAX) - 0.5;
+
+    *temperature = 25.0f + (float)(r1 * 4.0); /* ±2-3°C noise */
+    *latitude = base_lat + (r2 * 0.001);
+    *longitude = base_lon + (r3 * 0.001);
+    *altitude = base_alt + (r1 * 2.0);
+
+    /* IMU: small noise around static values */
+    *accel_x = (float)((r1) * 0.1);
+    *accel_y = (float)((r2) * 0.1);
+    *accel_z = 9.81f + (float)(r3 * 0.05);
+
+    *gyro_x = (float)((r1) * 0.01);
+    *gyro_y = (float)((r2) * 0.01);
+    *gyro_z = (float)((r3) * 0.01);
+
+    /* Magnetometer values approximated */
+    *mag_x = 45000.0f + (float)(r1 * 500.0);
+    *mag_y = 40000.0f + (float)(r2 * 500.0);
+    *mag_z = 48000.0f + (float)(r3 * 500.0);
+}
 
 /* Close and cleanup the agent */
 static void agent_close(TelemetryAgent *agent);
@@ -336,6 +376,9 @@ static int agent_init(TelemetryAgent *agent, const char *host,
             agent->use_stdout = false;
         }
     }
+
+    /* Seed RNG for mock data generator */
+    srand((unsigned int)(time(NULL) ^ getpid()));
     
     /* Print startup message */
     fprintf(agent->log_file, 
@@ -433,10 +476,33 @@ static int agent_send_packet(TelemetryAgent *agent) {
         /* In real implementation, set RPC timeout here */
     }
     
-    uint64_t send_time_ms = get_timestamp_ms();
-    fprintf(agent->log_file, 
-            "[SEND START] seq=%lu send_time_ms=%lu\n",
-            agent->sequence_number, send_time_ms);
+        /* Generate mock sensor data and create packet (logged inside create_packet) */
+        float temperature, accel_x, accel_y, accel_z;
+        float gyro_x, gyro_y, gyro_z;
+        float mag_x, mag_y, mag_z;
+        double latitude, longitude, altitude;
+
+        uint64_t pre_seq = agent->sequence_number;
+        generate_mock_sensor_data(pre_seq + 1,
+                      &temperature, &latitude, &longitude,
+                      &altitude,
+                      &accel_x, &accel_y, &accel_z,
+                      &gyro_x, &gyro_y, &gyro_z,
+                      &mag_x, &mag_y, &mag_z);
+
+        uint64_t send_time_ms = get_timestamp_ms();
+        create_packet(agent, 0, temperature, latitude, longitude, altitude,
+              accel_x, accel_y, accel_z,
+              gyro_x, gyro_y, gyro_z,
+              mag_x, mag_y, mag_z,
+              send_time_ms);
+
+          uint64_t ack_time_ms = 0;
+
+        /* Estimate payload size as sizeof(TelemetryPacket) for throughput calc */
+        uint64_t payload_bytes = (uint64_t)sizeof(TelemetryPacket);
+        fprintf(agent->log_file, "[SEND START] seq=%lu send_time_ms=%lu payload_bytes=%lu\n",
+            agent->sequence_number, send_time_ms, payload_bytes);
     
     /* Simulate RPC call with retry logic */
     int attempts = 0;
@@ -470,17 +536,81 @@ static int agent_send_packet(TelemetryAgent *agent) {
             continue;
         }
         
-        /* Simulate successful send */
-        uint64_t ack_time_ms = get_timestamp_ms();
+        /* Send JSON payload via HTTP POST using libcurl to the service HTTP endpoint */
+        {
+            CURL *curl = curl_easy_init();
+            if (!curl) {
+                fprintf(agent->log_file, "[SEND ERROR] seq=%lu error=-1 message=\"curl init failed\"\n", agent->sequence_number);
+                agent->errors++;
+                return -1;
+            }
+
+            char url[256];
+            snprintf(url, sizeof(url), "http://%s:8080/telemetry", agent->service_host);
+
+            /* Build JSON body */
+            char body[1024];
+            int n = snprintf(body, sizeof(body),
+                             "{\"device_id\":\"%s\",\"sequence_number\":%lu,\"timestamp_ms\":%lu,\"temperature\":%.3f,"
+                             "\"gps\":{\"latitude\":%.6f,\"longitude\":%.6f,\"altitude\":%.2f},"
+                             "\"imu\":{\"accel_x\":%.4f,\"accel_y\":%.4f,\"accel_z\":%.4f,"
+                             "\"gyro_x\":%.6f,\"gyro_y\":%.6f,\"gyro_z\":%.6f,"
+                             "\"mag_x\":%.2f,\"mag_y\":%.2f,\"mag_z\":%.2f}}",
+                             agent->device_id ? agent->device_id : "agent-c-unknown",
+                             agent->sequence_number + 1, send_time_ms, temperature,
+                             latitude, longitude, altitude,
+                             accel_x, accel_y, accel_z,
+                             gyro_x, gyro_y, gyro_z,
+                             mag_x, mag_y, mag_z);
+
+            struct curl_slist *headers = NULL;
+            headers = curl_slist_append(headers, "Content-Type: application/json");
+
+            curl_easy_setopt(curl, CURLOPT_URL, url);
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)n);
+            curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+            curl_easy_setopt(curl, CURLOPT_TIMEOUT, agent->timeout_sec);
+
+            CURLcode rc = curl_easy_perform(curl);
+            ack_time_ms = get_timestamp_ms();
+
+            if (rc != CURLE_OK) {
+                fprintf(agent->log_file, "[SEND ERROR] seq=%lu error=%d message=\"%s\"\n",
+                        agent->sequence_number, (int)rc, curl_easy_strerror(rc));
+                curl_slist_free_all(headers);
+                curl_easy_cleanup(curl);
+
+                if (attempts < agent->retry_count) {
+                    struct timespec ts;
+                    ts.tv_sec = 0;
+                    ts.tv_nsec = (agent->backoff_ms * 1000000ULL);
+                    nanosleep(&ts, NULL);
+                    fprintf(agent->log_file,
+                            "[RETRY] seq=%lu attempt=%d/%d backoff_ms=%d\n",
+                            agent->sequence_number, attempts, agent->retry_count,
+                            agent->backoff_ms);
+                    continue;
+                } else {
+                    agent->errors++;
+                    return -1;
+                }
+            }
+
+            /* success */
+            curl_slist_free_all(headers);
+            curl_easy_cleanup(curl);
+        }
         
-        /* Calculate RTT */
+        /* Calculate RTT (capture fresh ack timestamp) */
+        ack_time_ms = get_timestamp_ms();
         double rtt_ms = (double)(ack_time_ms - send_time_ms);
         
         /* Update statistics */
         agent->packets_sent++;
         agent->packets_received++;
-        agent->bytes_sent++;
-        agent->bytes_received++;
+        agent->bytes_sent += payload_bytes;
+        agent->bytes_received += payload_bytes;
         agent->rtt_sum += rtt_ms;
         agent->rtt_count++;
         agent->duration_s += (double)(ack_time_ms - send_time_ms) / 1000.0;
@@ -494,11 +624,15 @@ static int agent_send_packet(TelemetryAgent *agent) {
         }
         agent->avg_rtt_ms = agent->rtt_sum / agent->rtt_count;
         
-        /* Calculate throughput */
+        /* Calculate throughput: use payload_bytes and roundtrip */
         double throughput_kbps = (rtt_ms > 0) ?
-            (2.0 * 1024.0 * 1024.0) / rtt_ms : 0.0;
-        agent->avg_throughput_kbps = (agent->packets_sent > 0) ?
-            agent->avg_throughput_kbps : throughput_kbps;
+            ((double)payload_bytes * 2.0 * 1000.0) / rtt_ms / 1024.0 : 0.0;
+        /* Simple running average for throughput */
+        if (agent->packets_sent == 1) {
+            agent->avg_throughput_kbps = throughput_kbps;
+        } else {
+            agent->avg_throughput_kbps = ((agent->avg_throughput_kbps * (agent->packets_sent - 1)) + throughput_kbps) / agent->packets_sent;
+        }
         
         /* Log ACK received */
         fprintf(agent->log_file,

@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 
 project(telemetry_agent_c
     VERSION 1.0.0
-    DESCRIPTION "C Telemetry Agent for gRPC telemetry service"
+    DESCRIPTION "Telemetry Agent (C only)"
     LANGUAGES C
 )
 
@@ -28,41 +28,47 @@ elseif(CMAKE_BUILD_TYPE STREQUAL "Debug")
 endif()
 
 # Find Protobuf
+# Find Protobuf and gRPC
 find_package(Protobuf REQUIRED)
 message(STATUS "Found Protobuf: ${Protobuf_VERSION} at ${Protobuf_INCLUDE_DIRS}")
+find_package(gRPC CONFIG QUIET)
+if (gRPC_FOUND)
+    message(STATUS "Found gRPC via config")
+else()
+    message(STATUS "gRPC CMake config not found; falling back to finding libraries")
+    find_library(GRPC_CPP_LIB NAMES grpc++ grpc++_unsecure PATHS /usr/lib /usr/local/lib /usr/lib/x86_64-linux-gnu)
+    find_library(GRPC_LIB NAMES grpc PATHS /usr/lib /usr/local/lib /usr/lib/x86_64-linux-gnu)
+    if (GRPC_CPP_LIB AND GRPC_LIB)
+        message(STATUS "Found gRPC libraries: ${GRPC_CPP_LIB}; ${GRPC_LIB}")
+        # Set a local variable to indicate we have gRPC libs
+        set(gRPC_FOUND FALSE)
+        set(GRPC_LIBS_FOUND TRUE)
+    else()
+        message(STATUS "gRPC libraries not found; continuing without native gRPC support")
+        set(GRPC_LIBS_FOUND FALSE)
+        set(gRPC_FOUND FALSE)
+    endif()
+endif()
 
-# Create protobuf headers
-# Proto file is in parent directory (grpc-demo/proto)
-set(PROTO_FILE "${CMAKE_SOURCE_DIR}/../proto/telemetry.proto")
-set(PROTO_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/proto")
-set(PROTO_FILES "telemetry.proto")
-
-protobuf_generate_cpp(PROTO_SRCS PROTO_INCLUDES
-    "${PROTO_FILE}"
-)
-message(STATUS "Generated protobuf files in: ${PROTO_INCLUDE_DIR}")
-
-# Add include directories
-include_directories(${Protobuf_INCLUDE_DIRS})
-include_directories(${PROTO_INCLUDE_DIR})
-
-# Create executable
+# Build the C agent which uses the Python helper script for RPC
+message(STATUS "Building C agent (uses Python helper script for RPC)")
 add_executable(telemetry_agent
     telemetry_agent.c
-    ${PROTO_SRCS}
 )
-
-# Link protobuf libraries
 target_link_libraries(telemetry_agent
-    protobuf::libprotobuf
-    protobuf::libprotobuf-lite
+    pthread
+    m
 )
+find_package(CURL QUIET)
+if (CURL_FOUND)
+    target_include_directories(telemetry_agent PRIVATE ${CURL_INCLUDE_DIRS})
+    target_link_libraries(telemetry_agent ${CURL_LIBRARIES})
+else()
+    # Try linking libcurl directly
+    target_link_libraries(telemetry_agent curl)
+endif()
 
-# Enable shared libraries support (if needed for dynamic protobuf)
-set_target_properties(telemetry_agent PROPERTIES
-    CXX_STANDARD 14
-    CXX_STANDARD_REQUIRED ON
-)
+# No C++ properties required for C-only build
 
 # Install target
 install(TARGETS telemetry_agent
